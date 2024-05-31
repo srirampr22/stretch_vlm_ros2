@@ -27,7 +27,6 @@ class ProcessData(Behaviour):
         self.cv_bridge = CvBridge()
         self.bool_data = False
         self.bool_precidtion = False
-        self.bool_setup = False
         self.pre_processed_image = None
         self.TEXT_PROMPT = None
         self.BOX_TRESHOLD = 0.35
@@ -52,37 +51,39 @@ class ProcessData(Behaviour):
 
     def initialise(self):
         self.logger.info(f"{self.name} [initialise]")
-        # if self.blackboard.exists('text_message'):
-        #     self.logger.info("Text message received")
-        # if self.blackboard.exists('image'):
-        #     self.logger.info("Image received")
         if self.blackboard.exists('text_message') and self.blackboard.exists('image'):
             self.logger.info("Data received")
-            # input_text = self.blackboard.text_message
-            # input_image = self.cv_bridge.imgmsg_to_cv2(self.blackboard.image, "bgr")
-            # self.TEXT_PROMPT = input_text
-            # self.INPUT_IMAGE_CV2 = input_image
+            # input_text = self.blackboard.text_message # only this line is throwing an error: AttributeError: 'Blackboard' object has no attribute 'text_message'
+            input_text = self.blackboard.get('text_message')
+            input_image = self.blackboard.get('image')
+            cv2_image = self.cv_bridge.imgmsg_to_cv2(input_image, "bgr8") # image format is bgr8
+            self.TEXT_PROMPT = input_text
+            self.INPUT_IMAGE_CV2 = cv2.cvtColor(cv2_image, cv2.COLOR_BGR2RGB)
+            
+            self.logger.info(f"Text message: {self.TEXT_PROMPT}")
 
-            # self.pre_processed_image = vlm_model.preprocess_image(self.INPUT_IMAGE_CV2)
+            self.pre_processed_image = vlm_model.preprocess_image(cv2_image)
+            self.logger.info("Image preprocessed")
 
     def update(self):
         self.logger.info(f"{self.name} [update]")
-        if self.TEXT_PROMPT is not None:
-            # boxes, logits, phrases = predict(
-            #     model=self.model,
-            #     image=self.pre_processed_image,
-            #     caption=self.TEXT_PROMPT,
-            #     box_threshold=0.35,
-            #     text_threshold=0.25
-            # )
+        if self.pre_processed_image is not None:
+            boxes, logits, phrases = predict(
+                model=self.model,
+                image=self.pre_processed_image,
+                caption=self.TEXT_PROMPT,
+                box_threshold=self.BOX_TRESHOLD,
+                text_threshold=self.TEXT_TRESHOLD
+            )
 
-            # if boxes is not None and logits is not None and phrases is not None:
-            #     self.bool_precidtion = True
-            # time.sleep(5)  # import time
-            self.bool_precidtion = True
-
+            if boxes is not None and logits is not None and phrases is not None:
+                self.bool_precidtion = True
+                # if boxes
             if self.bool_precidtion:
-                self.logger.debug("Inference successful")
+                self.logger.info(f"Inference successful, found {phrases}")
+                post_processed_image = self.postprocessing(boxes, logits, phrases) # image is of the format bgr
+                image_msg = self.cv2_to_image(post_processed_image)
+                self.blackboard.set('inference_output', image_msg)  
                 return Status.SUCCESS
             else:
                 return Status.RUNNING
@@ -91,8 +92,18 @@ class ProcessData(Behaviour):
 
     def terminate(self, new_status):
         self.logger.debug(f"Action::terminate {self.name} to {new_status}")
+        
+    def postprocessing(self, boxes, logits, phrases):
+        image_source = self.INPUT_IMAGE_CV2
+        self.logger.info(f"inference image shape: {image_source.shape}")
+        annotated_frame = annotate(image_source=image_source, boxes=boxes, logits=logits, phrases=phrases)
+        return annotated_frame
+    
+    def cv2_to_image(self, cv2_image):
+        image_msg = self.cv_bridge.cv2_to_imgmsg(cv2_image, encoding="bgr8")
+        return image_msg
 
-
+        
 def create_behavior_tree():
     root = py_trees.composites.Sequence("Root", memory=True)
 
@@ -118,13 +129,26 @@ def create_behavior_tree():
         qos_profile=util.qos_profile_unlatched(),
         blackboard_variables={'image': None}
     )
+    
+    wait_for_inf_output = py_trees.behaviours.WaitForBlackboardVariable(
+        name="WaitForData",
+        variable_name="/inference_output"    
+        )
+    
+    inference_publisher = py_trees_ros.publishers.FromBlackboard(
+        name="InferencePublisher",
+        topic_name="/inference_output",
+        topic_type=Image,
+        qos_profile=util.qos_profile_unlatched(),
+        blackboard_variable="/inference_output"
+    )
 
     process_data = ProcessData()
 
-    # decorated_root = OneShot(name="OneShotDecorator", child=root, policy=OneShotPolicy.ON_COMPLETION)
+    decorated_root = OneShot(name="OneShotDecorator", child=root, policy=OneShotPolicy.ON_COMPLETION)
 
-    root.add_children([text_to_blackboard, image_to_blackboard, process_data])
-    return root
+    root.add_children([text_to_blackboard, image_to_blackboard, process_data, wait_for_inf_output, inference_publisher])
+    return decorated_root
 
 def main(args=None):
     rclpy.init(args=args)
@@ -173,44 +197,6 @@ def main(args=None):
     finally:
         tree.shutdown()
         rclpy.shutdown()
-
-
-# def main(args=None):
-#     rclpy.init(args=args)
-#     root = create_behavior_tree()
-#     tree = py_trees_ros.trees.BehaviourTree(
-#         root=root,
-#         unicode_tree_debug=True
-#     )
-
-#     # tree.visitors.append(py_trees.visitors.DebugVisitor())
-#     # snapshot_visitor = py_trees.visitors.SnapshotVisitor()
-#     # tree.visitors.append(snapshot_visitor)
-#     # display_tree.render_dot_tree(root=root, with_blackboard_variables=True)
-#     try:
-#         tree.setup(timeout=15)
-#     except py_trees_ros.exceptions.TimedOutError as e:
-#         console.logerror(console.red + "failed to setup the tree, aborting [{}]".format(str(e)) + console.reset)
-#         tree.shutdown()
-#         rclpy.try_shutdown()
-#         sys.exit(1)
-#     except KeyboardInterrupt:
-#         # not a warning, nor error, usually a user-initiated shutdown
-#         console.logerror("tree setup interrupted")
-#         tree.shutdown()
-#         rclpy.try_shutdown()
-#         sys.exit(1)
-
-#     tree.tick_tock(period_ms=1000.0)
-#     print("Tree tick-tocking")
-
-#     try:
-#         rclpy.spin(tree.node)
-#     except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):
-#         pass
-#     finally:
-#         tree.shutdown()
-#         rclpy.try_shutdown()
 
 if __name__ == '__main__':
     main()
